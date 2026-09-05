@@ -21,8 +21,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install project
-        run: pip install -e .
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
       - name: Compile Python files
         run: python -m compileall apps packages tests
