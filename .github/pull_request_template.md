@@ -1,4 +1,4 @@
-## Description - /version 1
+## Description
 
 <!-- What does this PR change? -->
 
