@@ -1,5 +1,5 @@
 # File: apps/detector/flood.py
-# Purpose: Detects flood-like network traffic patterns using learned baseline thresholds.
+# Purpose: Detects concentrated, SYN-heavy flood-like traffic without treating every traffic spike as an attack.
 
 from dataclasses import dataclass
 
@@ -16,13 +16,13 @@ class FloodDetection:
 
 
 class FloodDetector:
-    """Detects traffic patterns that resemble a concentrated network flood."""
+    """Detects concentrated and SYN-heavy flood-like traffic."""
 
     def __init__(
         self,
-        packet_multiplier: float = 3.0,
+        packet_multiplier: float = 2.5,
         syn_ratio_threshold: float = 0.70,
-        concentration_threshold: float = 0.80,
+        concentration_threshold: float = 0.70,
     ):
         self.packet_multiplier = packet_multiplier
         self.syn_ratio_threshold = syn_ratio_threshold
@@ -35,7 +35,9 @@ class FloodDetector:
         """Learn the normal packet-rate baseline."""
 
         if not baseline_windows:
-            raise ValueError("At least one baseline window is required.")
+            raise ValueError(
+                "At least one baseline window is required."
+            )
 
         packet_counts = [
             float(window.get("packets", 0))
@@ -54,13 +56,24 @@ class FloodDetector:
 
         if not self.ready:
             raise RuntimeError(
-                "Flood detector is not ready. Fit a baseline first."
+                "Flood detector is not ready. "
+                "Fit a baseline first."
             )
 
-        packets = float(window.get("packets", 0))
-        syn_count = float(window.get("syn_count", 0))
-        unique_dst_ips = int(window.get("unique_dst_ips", 0))
-        unique_dst_ports = int(window.get("unique_dst_ports", 0))
+        packets = float(
+            window.get("packets", 0)
+        )
+
+        syn_count = float(
+            window.get("syn_count", 0)
+        )
+
+        destination_concentration = float(
+            window.get(
+                "destination_concentration",
+                0.0,
+            )
+        )
 
         packet_rate = packets / 10.0
 
@@ -70,38 +83,50 @@ class FloodDetector:
             else 0.0
         )
 
-        destination_total = unique_dst_ips + unique_dst_ports
-
-        if destination_total == 0:
-            destination_concentration = 1.0
-        else:
-            destination_concentration = (
-                1.0 / destination_total
-            )
-
         high_packet_rate = (
-            packets >= self.packet_baseline * self.packet_multiplier
+            packets
+            >= self.packet_baseline
+            * self.packet_multiplier
         )
 
-        concentrated_target = (
-            unique_dst_ips <= 2
-            and unique_dst_ports <= 2
+        concentrated_destination = (
+            destination_concentration
+            >= self.concentration_threshold
         )
 
+        syn_heavy = (
+            syn_ratio
+            >= self.syn_ratio_threshold
+        )
+
+        # Strong flood signature:
+        # high volume + concentrated target + SYN-heavy.
         syn_flood_pattern = (
-            syn_ratio >= self.syn_ratio_threshold
-            and packets >= self.packet_baseline
+            high_packet_rate
+            and concentrated_destination
+            and syn_heavy
+        )
+
+        # Secondary signature:
+        # extremely concentrated high-volume traffic.
+        concentrated_flood_pattern = (
+            high_packet_rate
+            and concentrated_destination
+            and packets
+            >= self.packet_baseline * 4.0
         )
 
         flood_detected = (
-            high_packet_rate
-            and concentrated_target
-        ) or syn_flood_pattern
+            syn_flood_pattern
+            or concentrated_flood_pattern
+        )
 
         if syn_flood_pattern:
             reason = "syn_flood_pattern"
-        elif high_packet_rate and concentrated_target:
+
+        elif concentrated_flood_pattern:
             reason = "concentrated_traffic_flood"
+
         else:
             reason = "normal"
 
@@ -110,5 +135,7 @@ class FloodDetector:
             reason=reason,
             packet_rate=packet_rate,
             syn_ratio=syn_ratio,
-            destination_concentration=destination_concentration,
+            destination_concentration=(
+                destination_concentration
+            ),
         )

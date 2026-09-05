@@ -99,18 +99,18 @@ class DetectionEngine:
 
         return pd.DataFrame(rows)
 
-    def mark_live_cursor(self):
-        """Move the Elasticsearch fetch cursor to the current window."""
+    def mark_live_cursor(self, windows=None):
+        """Advance the fetch cursor without skipping unprocessed windows."""
 
-        now = datetime.now(timezone.utc)
+        if not windows:
+            return
 
-        epoch = int(now.timestamp())
-        window_start = epoch - (epoch % 10)
+        latest_window = max(
+            windows,
+            key=lambda window: window["window_end"],
+        )
 
-        self.fetch_gte = datetime.fromtimestamp(
-            window_start,
-            tz=timezone.utc,
-        ).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+        self.fetch_gte = latest_window["window_end"]
 
     def _combine_detection_results(self, window, ml_result):
         """Combine Isolation Forest and flood analysis into one SHIELD result."""
@@ -163,7 +163,7 @@ class DetectionEngine:
         ]
 
         if not windows:
-            self.mark_live_cursor()
+            self.mark_live_cursor(windows)
             return
 
         # ---------------------------------------------------------
@@ -200,7 +200,7 @@ class DetectionEngine:
 
                 print("Baseline ready.")
 
-            self.mark_live_cursor()
+            self.mark_live_cursor(windows)
             return
 
         # ---------------------------------------------------------
@@ -244,7 +244,7 @@ class DetectionEngine:
             f"{flood_events} flood-like."
         )
 
-        self.mark_live_cursor()
+        self.mark_live_cursor(windows)
 
 
 def main():
