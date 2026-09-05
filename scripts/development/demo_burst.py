@@ -1,97 +1,235 @@
 # File: scripts/development/demo_burst.py
-# Purpose: Generates safe localhost-only traffic for testing SHIELD anomaly detection.
+# Purpose: Generates three isolated synthetic traffic phases for a safe SHIELD flood-detection demonstration.
 
-import argparse
-import socket
 import sys
-from concurrent.futures import ThreadPoolExecutor
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+
+from elasticsearch import Elasticsearch
 
 
-LOCALHOST = "127.0.0.1"
+ELASTICSEARCH_URL = "http://localhost:9200"
+LOGS_INDEX = "logs"
+
+LOCAL_SOURCE_IP = "192.168.0.135"
+
+NORMAL_EVENTS = 30
+SPIKE_EVENTS = 300
+FLOOD_EVENTS = 3000
+
+NORMAL_DESTINATIONS = [
+    ("8.8.8.8", 443),
+    ("1.1.1.1", 443),
+    ("142.250.72.14", 443),
+    ("151.101.1.69", 443),
+]
+
+SPIKE_DESTINATIONS = [
+    ("8.8.8.8", 443),
+    ("1.1.1.1", 443),
+    ("142.250.72.14", 443),
+    ("151.101.1.69", 443),
+    ("20.42.73.24", 443),
+    ("52.84.150.10", 443),
+    ("104.16.132.229", 443),
+    ("172.217.160.78", 443),
+]
+
+FLOOD_DESTINATION = ("192.168.0.1", 80)
 
 
-def scan_local_ports(start: int, end: int) -> None:
-    print(
-        f"TCP connection burst to {LOCALHOST} ports {start}-{end}"
-    )
+def create_event(
+    timestamp: datetime,
+    src_ip: str,
+    dst_ip: str,
+    dst_port: int,
+    protocol: str = "TCP",
+    flags: str = "",
+    packet_size: int = 100,
+) -> dict:
+    """Create one synthetic SHIELD network event."""
 
-    def hit(port: int) -> None:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.05)
+    return {
+        "event_id": str(uuid.uuid4()),
+        "timestamp": timestamp.isoformat(),
+        "@timestamp": timestamp.isoformat(),
+        "sensor_id": "demo-sensor",
+        "src_ip": src_ip,
+        "dst_ip": dst_ip,
+        "src_port": 50000,
+        "dst_port": dst_port,
+        "protocol": protocol,
+        "protocol_num": 6 if protocol == "TCP" else 17,
+        "packet_size": packet_size,
+        "bytes": packet_size,
+        "flags": flags,
+    }
 
-        try:
-            sock.connect((LOCALHOST, port))
-        except OSError:
-            pass
-        finally:
-            sock.close()
 
-    with ThreadPoolExecutor(max_workers=64) as pool:
-        list(pool.map(hit, range(start, end + 1)))
+def send_events(es: Elasticsearch, events: list[dict]) -> None:
+    """Insert synthetic events into Elasticsearch."""
+
+    for event in events:
+        es.index(
+            index=LOGS_INDEX,
+            id=event["event_id"],
+            document=event,
+        )
 
 
-def udp_scan_local(count: int, base_port: int) -> None:
-    print(
-        f"UDP burst: {count} packets to "
-        f"{LOCALHOST}:{base_port}-{base_port + count - 1}"
-    )
+def normal_traffic(es: Elasticsearch, start: datetime) -> None:
+    """Generate distributed ordinary traffic."""
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    payload = b"x" * 16
+    events = []
 
-    try:
-        for i in range(count):
-            sock.sendto(
-                payload,
-                (LOCALHOST, base_port + i),
+    for index in range(NORMAL_EVENTS):
+        dst_ip, dst_port = NORMAL_DESTINATIONS[
+            index % len(NORMAL_DESTINATIONS)
+        ]
+
+        timestamp = start + timedelta(milliseconds=index * 200)
+
+        events.append(
+            create_event(
+                timestamp=timestamp,
+                src_ip=LOCAL_SOURCE_IP,
+                dst_ip=dst_ip,
+                dst_port=dst_port,
+                flags="PA",
+                packet_size=120,
             )
-    finally:
-        sock.close()
+        )
+
+    send_events(es, events)
+
+    print(f"Normal traffic: {len(events)} events sent.")
+
+
+def traffic_spike(es: Elasticsearch, start: datetime) -> None:
+    """Generate a high-volume but distributed traffic spike."""
+
+    events = []
+
+    for index in range(SPIKE_EVENTS):
+        dst_ip, dst_port = SPIKE_DESTINATIONS[
+            index % len(SPIKE_DESTINATIONS)
+        ]
+
+        timestamp = start + timedelta(
+            milliseconds=index * 30
+        )
+
+        events.append(
+            create_event(
+                timestamp=timestamp,
+                src_ip=LOCAL_SOURCE_IP,
+                dst_ip=dst_ip,
+                dst_port=dst_port,
+                flags="PA",
+                packet_size=120,
+            )
+        )
+
+    send_events(es, events)
+
+    print(f"Traffic spike: {len(events)} events sent.")
+
+
+def flood_like_traffic(es: Elasticsearch, start: datetime) -> None:
+    """Generate concentrated SYN-heavy flood-like traffic."""
+
+    dst_ip, dst_port = FLOOD_DESTINATION
+    events = []
+
+    for index in range(FLOOD_EVENTS):
+        source_ip = (
+            f"10.99.{index // 250}.{(index % 250) + 1}"
+        )
+
+        timestamp = start + timedelta(
+            milliseconds=index * 3
+        )
+
+        events.append(
+            create_event(
+                timestamp=timestamp,
+                src_ip=source_ip,
+                dst_ip=dst_ip,
+                dst_port=dst_port,
+                flags="S",
+                packet_size=60,
+            )
+        )
+
+    send_events(es, events)
+
+    print(
+        f"Flood-like traffic: {len(events)} SYN events sent "
+        f"toward {dst_ip}:{dst_port}."
+    )
+
+
+def wait_for_window() -> datetime:
+    """Wait until the next clean 10-second window begins."""
+
+    now = datetime.now(timezone.utc)
+
+    next_epoch = (
+        int(now.timestamp() / 10) + 1
+    ) * 10
+
+    start = datetime.fromtimestamp(
+        next_epoch,
+        tz=timezone.utc,
+    )
+
+    wait_seconds = (
+        start - now
+    ).total_seconds()
+
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+
+    return start
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Generate localhost-only SHIELD demo traffic."
-    )
+    """Run the complete isolated SHIELD traffic demonstration."""
 
-    parser.add_argument(
-        "--mode",
-        choices=("scan", "flood", "both"),
-        default="both",
-    )
+    es = Elasticsearch(ELASTICSEARCH_URL)
 
-    parser.add_argument("--start-port", type=int, default=1)
-    parser.add_argument("--end-port", type=int, default=400)
-    parser.add_argument("--flood-count", type=int, default=400)
-    parser.add_argument("--flood-port", type=int, default=20000)
-
-    args = parser.parse_args()
-
-    if (
-        args.start_port < 1
-        or args.end_port > 65535
-        or args.start_port > args.end_port
-    ):
-        print("Port range must be 1-65535 and start <= end.")
+    if not es.ping():
+        print("Elasticsearch is not reachable.")
         sys.exit(1)
 
-    print(
-        f"Target is always {LOCALHOST}. "
-        "Nothing is sent to the Wi-Fi LAN."
-    )
+    print("SHIELD safe traffic demonstration")
+    print("----------------------------------")
+    print("Synthetic Elasticsearch telemetry only.")
+    print()
 
-    if args.mode in ("scan", "both"):
-        scan_local_ports(
-            args.start_port,
-            args.end_port,
-        )
+    # Phase 1: normal traffic.
+    start = wait_for_window()
+    normal_traffic(es, start)
 
-    if args.mode in ("flood", "both"):
-        udp_scan_local(
-            args.flood_count,
-            args.flood_port,
-        )
+    print("Waiting for normal window to complete...")
+    time.sleep(12)
 
+    # Phase 2: legitimate traffic spike.
+    start = wait_for_window()
+    traffic_spike(es, start)
+
+    print("Waiting for spike window to complete...")
+    time.sleep(12)
+
+    # Phase 3: flood-like traffic.
+    start = wait_for_window()
+    flood_like_traffic(es, start)
+
+    print("Waiting for flood window to complete...")
+    time.sleep(12)
+
+    print()
     print("Demo traffic generation complete.")
 
 
