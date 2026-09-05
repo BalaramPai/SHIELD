@@ -1,0 +1,9 @@
+scapy
+elasticsearch
+pandas
+numpy
+scikit-learn
+requests
+fastapi
+uvicorn
+python-dotenv
