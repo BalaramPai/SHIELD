@@ -1,3 +1,6 @@
+# File: packages/schemas/detections.py
+# Purpose: Defines the shared structure for detection results produced by SHIELD detectors.
+
 from dataclasses import dataclass
 from datetime import datetime
 
