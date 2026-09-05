@@ -1,5 +1,8 @@
+# File: requirements.txt
+# Purpose: Defines the Python dependencies required to run SHIELD.
+
 scapy
-elasticsearch
+elasticsearch>=8.12,<9
 pandas
 numpy
 scikit-learn
