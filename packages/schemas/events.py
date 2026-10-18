@@ -1,3 +1,6 @@
+# File: packages/schemas/events.py
+# Purpose: Defines the shared structure for raw network events produced by the sensor.
+
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -11,5 +14,7 @@ class NetworkEvent:
     dst_ip: str
     src_port: int | None
     dst_port: int | None
-    protocol: int
+    protocol: str
+    protocol_num: int
     packet_size: int
+    flags: str

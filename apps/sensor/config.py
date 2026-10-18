@@ -1,3 +1,6 @@
+# File: apps/sensor/config.py
+# Purpose: Provides configuration values used by the SHIELD network sensor.
+
 from packages.config.settings import settings
 
 
