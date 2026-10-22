@@ -96,36 +96,46 @@ def _context_url(index: str, aggregations: dict) -> dict:
     }
 
 
-def _filtered_url(index: str, query: dict, size: int = 500) -> dict:
-    """Build a Vega Elasticsearch query with an explicit filter."""
+def _filtered_url(
+    index: str,
+    query: dict,
+    size: int = 500,
+    aggregations: dict | None = None,
+) -> dict:
+    """Build a Vega Elasticsearch query with filters and optional aggregations."""
+
+    body = {
+        "size": size,
+        "query": {
+            "bool": {
+                "filter": [
+                    {
+                        "range": {
+                            "@timestamp": {
+                                "%timefilter%": True,
+                            }
+                        }
+                    },
+                    "%dashboard_context-filter_clause%",
+                    query,
+                ]
+            }
+        },
+        "sort": [
+            {
+                "@timestamp": {
+                    "order": "asc",
+                }
+            }
+        ],
+    }
+
+    if aggregations:
+        body["aggs"] = aggregations
 
     return {
         "index": index,
-        "body": {
-            "size": size,
-            "query": {
-                "bool": {
-                    "filter": [
-                        {
-                            "range": {
-                                "@timestamp": {
-                                    "%timefilter%": True,
-                                }
-                            }
-                        },
-                        "%dashboard_context-filter_clause%",
-                        query,
-                    ]
-                }
-            },
-            "sort": [
-                {
-                    "@timestamp": {
-                        "order": "asc",
-                    }
-                }
-            ],
-        },
+        "body": body,
     }
 
 
@@ -471,79 +481,61 @@ def detector_traffic_spec() -> dict:
         "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
         "title": "Detection activity — normal traffic vs anomalies",
         "data": {
-            "url": {
-                "index": f"{RESULTS_INDEX}*",
-                "body": {
-                    "size": 500,
-                    "query": {
-                        "bool": {
-                            "filter": [
-                                {
-                                    "range": {
-                                        "@timestamp": {
-                                            "%timefilter%": True,
-                                        }
-                                    }
-                                },
-                                "%dashboard_context-filter_clause%",
-                            ]
-                        }
+                    "url": _filtered_url(
+                        f"{RESULTS_INDEX}*",
+                        {"match_all": {}},
+                        size=500,
+                    ),
+                    "format": {
+                        "property": "hits.hits",
                     },
-                    "sort": [
-                        {
-                            "@timestamp": {
-                                "order": "asc",
-                            }
-                        }
-                    ],
                 },
-            },
-            "format": {
-                "property": "hits.hits",
-            },
-        },
-        "transform": [
-            {
-                "calculate": "datum._source['@timestamp']",
-                "as": "time",
-            },
-            {
-                "calculate": "datum._source.packets",
-                "as": "packets",
-            },
-            {
-                "calculate": "datum._source.anomaly_score",
-                "as": "score",
-            },
-            {
-                "calculate": "datum._source.threshold",
-                "as": "threshold",
-            },
-            {
-                "calculate": "datum._source.status",
-                "as": "status",
-            },
-            {
-                "calculate": "datum._source.reason",
-                "as": "reason",
-            },
-            {
-                "calculate": "datum._source.unique_dst_ports",
-                "as": "ports",
-            },
-            {
-                "calculate": "datum._source.unique_dst_ips",
-                "as": "unique_ips",
-            },
-            {
-                "calculate": "datum._source.sample_src_ip",
-                "as": "src_ip",
-            },
-            {
-                "calculate": "datum._source.sample_dst_ip",
-                "as": "dst_ip",
-            },
-        ],
+                    "transform": [
+    {
+        "calculate": "datum._source['@timestamp']",
+        "as": "time",
+    },
+    {
+        "calculate": "datum._source.packets",
+        "as": "packets",
+    },
+    {
+        "calculate": "datum._source.status || 'UNKNOWN'",
+        "as": "status",
+    },
+    {
+        "calculate": "datum._source.reason || 'unknown'",
+        "as": "reason",
+    },
+    {
+        "calculate": "datum._source.anomaly_score",
+        "as": "score",
+    },
+    {
+        "calculate": "datum._source.threshold",
+        "as": "threshold",
+    },
+    {
+        "calculate": "datum._source.unique_dst_ports",
+        "as": "ports",
+    },
+    {
+        "calculate": "datum._source.unique_dst_ips",
+        "as": "unique_ips",
+    },
+    {
+        "calculate": "datum._source.sample_src_ip",
+        "as": "src_ip",
+    },
+    {
+        "calculate": "datum._source.sample_dst_ip",
+        "as": "dst_ip",
+    },
+    {
+        "filter": "isValid(datum.time) && isValid(datum.packets)",
+    },
+],
+
         "mark": {
             "type": "line",
             "point": True,
@@ -623,6 +615,54 @@ def detector_traffic_spec() -> dict:
     }
 
 
+# def anomaly_reasons_spec() -> dict:
+#     return {
+#         "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+#         "title": "Why SHIELD detected anomalies",
+#         "data": {
+#             "url": _filtered_url(
+#                 f"{RESULTS_INDEX}*",
+#                 {
+#                     "term": {
+#                         "anomaly": -1,
+#                     }
+#                 },
+#                 size=0,
+#             ),
+#             "format": {
+#                 "property": "aggregations.reasons.buckets",
+#             },
+#         },
+#         "mark": {
+#             "type": "bar",
+#             "tooltip": True,
+#         },
+#         "encoding": {
+#             "y": {
+#                 "field": "key",
+#                 "type": "nominal",
+#                 "sort": "-x",
+#                 "title": "Detection reason",
+#             },
+#             "x": {
+#                 "field": "doc_count",
+#                 "type": "quantitative",
+#                 "title": "Occurrences",
+#             },
+#             "tooltip": [
+#                 {
+#                     "field": "key",
+#                     "type": "nominal",
+#                     "title": "Reason",
+#                 },
+#                 {
+#                     "field": "doc_count",
+#                     "type": "quantitative",
+#                     "title": "Occurrences",
+#                 },
+#             ],
+#         },
+#     }
 def anomaly_reasons_spec() -> dict:
     return {
         "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
@@ -630,12 +670,17 @@ def anomaly_reasons_spec() -> dict:
         "data": {
             "url": _filtered_url(
                 f"{RESULTS_INDEX}*",
-                {
-                    "term": {
-                        "anomaly": -1,
+                {"term": {"ml_anomaly": True}},
+                size=0,
+                aggregations={
+                    "reasons": {
+                        "terms": {
+                            "field": "reason.keyword",
+                            "size": 10,
+                            "order": {"_count": "desc"},
+                        }
                     }
                 },
-                size=0,
             ),
             "format": {
                 "property": "aggregations.reasons.buckets",
@@ -671,7 +716,6 @@ def anomaly_reasons_spec() -> dict:
             ],
         },
     }
-
 
 def normal_vs_anomaly_spec() -> dict:
     return {
