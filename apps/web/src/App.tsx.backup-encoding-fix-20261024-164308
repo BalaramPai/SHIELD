@@ -1,0 +1,537 @@
+﻿
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import './App.css'
+
+const API = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/$/, '')
+const KIBANA = import.meta.env.VITE_KIBANA_URL || ''
+
+type Row = Record<string, any>
+type Section = 'Overview' | 'Incidents' | 'Observed IPs' | 'Kibana' | 'AI Assistant'
+const NAV: Section[] = ['Overview', 'Incidents', 'Observed IPs', 'Kibana', 'AI Assistant']
+
+async function get(path: string): Promise<any> {
+  const response = await fetch(`${API}${path}`)
+  if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`)
+  return response.json()
+}
+
+function rows(value: any): Row[] {
+  if (Array.isArray(value)) return value
+  for (const key of ['value', 'items', 'results', 'incidents', 'devices', 'events', 'data']) {
+    if (Array.isArray(value?.[key])) return value[key]
+  }
+  return []
+}
+
+function fmtDate(value: any): string {
+  if (!value) return 'â€”'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString()
+}
+
+function num(value: any): string {
+  return Number(value || 0).toLocaleString()
+}
+
+function anomaly(row: Row): boolean {
+  return row.anomaly === -1 || row.anomaly === '-1' ||
+    String(row.status || '').toUpperCase() === 'ANOMALY' ||
+    row.flood_detected === true
+}
+
+function display(value: any): string {
+  return value === undefined || value === null || value === '' ? 'â€”' : String(value)
+}
+
+function App() {
+  const [page, setPage] = useState<Section>('Overview')
+  const [health, setHealth] = useState<Row | null>(null)
+  const [systemHealth, setSystemHealth] = useState<Row | null>(null)
+  const [, setStatus] = useState<Row | null>(null)
+  const [overview, setOverview] = useState<Row | null>(null)
+  const [incidents, setIncidents] = useState<Row[]>([])
+  const [ips, setIps] = useState<Row[]>([])
+  const [events, setEvents] = useState<Row[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [updated, setUpdated] = useState<Date | null>(null)
+  const [question, setQuestion] = useState('')
+
+  const [search, setSearch] = useState('')
+  const [severity, setSeverity] = useState('all')
+  const [selectedIncident, setSelectedIncident] = useState<Row | null>(null)
+  const [incidentDetail, setIncidentDetail] = useState<Row | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+
+  const [ipSearch, setIpSearch] = useState('')
+  const [scopeFilter, setScopeFilter] = useState('all')
+  const [trafficSearch, setTrafficSearch] = useState('')
+  const [protocolFilter, setProtocolFilter] = useState('all')
+  const [portFilter, setPortFilter] = useState('all')
+
+  const refresh = useCallback(async () => {
+    setLoading(true)
+    const results = await Promise.allSettled([
+      get('/health'),
+      get('/system-health'),
+      get('/status'),
+      get('/overview?minutes=60'),
+      get('/incidents?limit=100'),
+      get('/devices?limit=50'),
+      get('/events?limit=100'),
+    ])
+
+    const [h, sh, s, o, i, d, e] = results
+    setHealth(h.status === 'fulfilled' ? h.value : null)
+    setSystemHealth(sh.status === 'fulfilled' ? sh.value : null)
+    setStatus(s.status === 'fulfilled' ? s.value : null)
+    setOverview(o.status === 'fulfilled' ? o.value : null)
+    setIncidents(i.status === 'fulfilled' ? rows(i.value) : [])
+    setIps(d.status === 'fulfilled' ? rows(d.value) : [])
+    setEvents(e.status === 'fulfilled' ? rows(e.value) : [])
+
+    const failed = results.filter(result => result.status === 'rejected').length
+    setError(failed === results.length
+      ? 'SHIELD API is unavailable. Start the backend and retry.'
+      : failed > 0 ? `${failed} data request(s) failed.` : '')
+    setUpdated(new Date())
+    setLoading(false)
+  }, [])
+
+  useEffect(() => {
+    void refresh()
+    const timer = window.setInterval(() => void refresh(), 15000)
+    return () => window.clearInterval(timer)
+  }, [refresh])
+
+  const apiHealthy = health?.status === 'healthy' && health?.elasticsearch === true
+  const traffic = overview?.traffic || {}
+  const detections = overview?.detections || {}
+  const trend: Row[] = traffic.events_over_time || []
+  const protocols: Row[] = traffic.protocols || []
+  const latestAlert: Row | null = detections.latest_alert || null
+
+  const filteredIncidents = useMemo(() => {
+    const term = search.trim().toLowerCase()
+    return incidents.filter(row => {
+      const flagged = anomaly(row)
+      if (severity === 'anomaly' && !flagged) return false
+      if (severity === 'other' && flagged) return false
+      if (!term) return true
+      return [
+        row.event_id, row.reason, row.detector, row.status,
+        row.src_ip, row.dst_ip, row.protocol, row.dst_port,
+      ].some(value => String(value ?? '').toLowerCase().includes(term))
+    })
+  }, [incidents, search, severity])
+
+  const filteredIPs = useMemo(() => {
+    const term = ipSearch.trim().toLowerCase()
+    return ips.filter(row => {
+      const ip = String(row.ip_address || row.src_ip || '')
+      const scope = String(row.address_scope || 'Unknown')
+      if (scopeFilter !== 'all' && scope.toLowerCase() !== scopeFilter) return false
+      return !term || ip.toLowerCase().includes(term)
+    })
+  }, [ips, ipSearch, scopeFilter])
+
+  const filteredEvents = useMemo(() => {
+    const term = trafficSearch.trim().toLowerCase()
+    return events.filter(row => {
+      const protocol = String(row.protocol || 'Unknown').toUpperCase()
+      const port = display(row.dst_port)
+      if (protocolFilter !== 'all' && protocol.toLowerCase() !== protocolFilter) return false
+      if (portFilter !== 'all' && port !== portFilter) return false
+      if (!term) return true
+      return [
+        row.src_ip, row.dst_ip, row.protocol, row.dst_port,
+        row.src_port, row.packet_size, row.bytes,
+      ].some(value => String(value ?? '').toLowerCase().includes(term))
+    })
+  }, [events, trafficSearch, protocolFilter, portFilter])
+
+  const eventProtocols = useMemo(() => {
+    const counts = new Map<string, number>()
+    events.forEach(row => {
+      const protocol = String(row.protocol || 'Unknown').toUpperCase()
+      counts.set(protocol, (counts.get(protocol) || 0) + 1)
+    })
+    return [...counts.entries()]
+      .map(([protocol, count]) => ({ protocol, count }))
+      .sort((a, b) => b.count - a.count)
+  }, [events])
+
+  const topPorts = useMemo(() => {
+    const counts = new Map<string, number>()
+    events.forEach(row => {
+      const port = display(row.dst_port)
+      if (port !== 'â€”') counts.set(port, (counts.get(port) || 0) + 1)
+    })
+    return [...counts.entries()]
+      .map(([port, count]) => ({ port, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 8)
+  }, [events])
+
+  async function openIncident(row: Row) {
+    setSelectedIncident(row)
+    setIncidentDetail(null)
+    const id = row.event_id || row.id
+    if (!id) return
+    setDetailLoading(true)
+    try {
+      setIncidentDetail(await get(`/incidents/${encodeURIComponent(String(id))}`))
+    } catch {
+      setIncidentDetail(row)
+    } finally {
+      setDetailLoading(false)
+    }
+  }
+
+  function openKibana() {
+    if (KIBANA) window.open(KIBANA, '_blank', 'noopener,noreferrer')
+    else setError('Set VITE_KIBANA_URL in apps/web/.env.local.')
+  }
+
+  function renderTrend() {
+    if (!trend.length) return <div className="empty">No traffic trend data available.</div>
+    const max = Math.max(...trend.map(item => Number(item.events || 0)), 1)
+    const width = 700
+    const height = 210
+    const points = trend.map((item, index) => {
+      const x = trend.length === 1 ? width / 2 : index * width / (trend.length - 1)
+      const y = height - (Number(item.events || 0) / max) * (height - 24) - 8
+      return `${x},${y}`
+    }).join(' ')
+
+    return <div className="chart-area">
+      <div className="chart-summary">
+        <span>{num(trend.reduce((sum, item) => sum + Number(item.events || 0), 0))} events in displayed buckets</span>
+        <span>5-minute buckets</span>
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} className="trend-chart" role="img" aria-label="Network traffic trend">
+        {[0, 1, 2, 3].map(line =>
+          <line key={line} x1="0" x2={width} y1={line * height / 3 + 8} y2={line * height / 3 + 8} className="chart-gridline" />
+        )}
+        <polyline points={points} className="chart-line" />
+        {trend.map((item, index) => {
+          const x = trend.length === 1 ? width / 2 : index * width / (trend.length - 1)
+          const y = height - (Number(item.events || 0) / max) * (height - 24) - 8
+          return <circle key={`${item.time}-${index}`} cx={x} cy={y} r="4" className="chart-point">
+            <title>{`${fmtDate(item.time)}: ${num(item.events)} events`}</title>
+          </circle>
+        })}
+      </svg>
+      <div className="chart-labels"><span>{fmtDate(trend[0]?.time)}</span><span>{fmtDate(trend[trend.length - 1]?.time)}</span></div>
+    </div>
+  }
+
+  function renderProtocols() {
+    const total = protocols.reduce((sum, item) => sum + Number(item.events || 0), 0)
+    if (!protocols.length) return <div className="empty">No protocol data available.</div>
+    return <div className="protocol-list">{protocols.map(item => {
+      const count = Number(item.events || 0)
+      const percent = total ? count / total * 100 : 0
+      return <div className="protocol-row" key={item.protocol}>
+        <div className="protocol-label"><span>{item.protocol}</span><strong>{num(count)}</strong></div>
+        <div className="progress-track"><div className="progress-fill" style={{ width: `${percent}%` }} /></div>
+        <small>{percent.toFixed(1)}%</small>
+      </div>
+    })}</div>
+  }
+
+  function renderEventProtocolBreakdown() {
+    const total = eventProtocols.reduce((sum, item) => sum + item.count, 0)
+    if (!eventProtocols.length) return <div className="empty">No protocol information in recent events.</div>
+    return <div className="protocol-list">{eventProtocols.map(item => {
+      const percent = total ? item.count / total * 100 : 0
+      return <div className="protocol-row" key={item.protocol}>
+        <div className="protocol-label"><span>{item.protocol}</span><strong>{num(item.count)}</strong></div>
+        <div className="progress-track"><div className="progress-fill" style={{ width: `${percent}%` }} /></div>
+        <small>{percent.toFixed(1)}%</small>
+      </div>
+    })}</div>
+  }
+
+  function renderIncidents() {
+    if (loading && !incidents.length) return <div className="empty">Loading alertsâ€¦</div>
+    if (!filteredIncidents.length) return <div className="empty">No alerts match these filters.</div>
+    return <div className="table-wrap"><table>
+      <thead><tr><th>Time</th><th>Event ID</th><th>Reason</th><th>Source IP</th><th>Destination IP</th><th>Method</th><th>Packets</th><th>Classification</th><th></th></tr></thead>
+      <tbody>{filteredIncidents.map((row, index) => <tr key={row.event_id || index}>
+        <td>{fmtDate(row.timestamp ?? row['@timestamp'])}</td>
+        <td className="mono">{display(row.event_id)}</td>
+        <td>{String(row.reason || 'â€”').replaceAll('_', ' ')}</td>
+        <td className="mono">{display(row.src_ip)}</td>
+        <td className="mono">{display(row.dst_ip)}</td>
+        <td>{display(row.detector)}</td>
+        <td>{num(row.packets)}</td>
+        <td><span className={`pill ${anomaly(row) ? 'danger' : 'neutral'}`}>{anomaly(row) ? 'Anomaly' : row.status || 'Recorded'}</span></td>
+        <td><button className="text-button" onClick={() => void openIncident(row)}>Details â†’</button></td>
+      </tr>)}</tbody>
+    </table></div>
+  }
+
+  function renderIPs() {
+    if (!filteredIPs.length) return <div className="empty">No IP addresses match these filters.</div>
+    return <div className="table-wrap"><table>
+      <thead><tr><th>IP address</th><th>Scope</th><th>Event count</th><th>Last seen</th></tr></thead>
+      <tbody>{filteredIPs.map((row, index) => <tr key={row.ip_address || row.src_ip || index}>
+        <td className="mono">{row.ip_address || row.src_ip || 'â€”'}</td>
+        <td><span className="pill neutral">{row.address_scope || 'Unknown'}</span></td>
+        <td>{num(row.event_count)}</td>
+        <td>{fmtDate(row.last_seen)}</td>
+      </tr>)}</tbody>
+    </table></div>
+  }
+
+  function renderEvents() {
+    if (!filteredEvents.length) return <div className="empty">No network events match these filters.</div>
+    return <div className="table-wrap"><table>
+      <thead><tr><th>Time</th><th>Source IP</th><th>Destination IP</th><th>Protocol</th><th>Source port</th><th>Destination port</th><th>Size</th></tr></thead>
+      <tbody>{filteredEvents.map((row, index) => <tr key={`${row['@timestamp'] || row.timestamp}-${index}`}>
+        <td>{fmtDate(row['@timestamp'] || row.timestamp)}</td>
+        <td className="mono">{display(row.src_ip)}</td>
+        <td className="mono">{display(row.dst_ip)}</td>
+        <td>{display(row.protocol)}</td>
+        <td>{display(row.src_port)}</td>
+        <td>{display(row.dst_port)}</td>
+        <td>{display(row.packet_size ?? row.bytes)}</td>
+      </tr>)}</tbody>
+    </table></div>
+  }
+
+  function renderIncidentDetails() {
+    if (!selectedIncident) return null
+    const row = incidentDetail || selectedIncident
+    const fields: [string, any][] = [
+      ['Event ID', row.event_id],
+      ['Timestamp', row.timestamp || row['@timestamp']],
+      ['Status', row.status],
+      ['Detection method', row.detector],
+      ['Reason', row.reason],
+      ['Source IP', row.src_ip],
+      ['Destination IP', row.dst_ip],
+      ['Protocol', row.protocol],
+      ['Destination port', row.dst_port],
+      ['Packets', row.packets],
+      ['SYN count', row.syn_count],
+      ['Unique destination IPs', row.unique_dst_ips],
+      ['Unique destination ports', row.unique_dst_ports],
+      ['Anomaly score', row.anomaly_score],
+      ['Threshold', row.threshold],
+    ]
+
+    return <div className="modal-backdrop" onClick={() => setSelectedIncident(null)}>
+      <section className="incident-modal" role="dialog" aria-modal="true" aria-label="Alert details" onClick={event => event.stopPropagation()}>
+        <div className="panel-heading">
+          <div><h2>Alert evidence</h2><p>{row.event_id || 'Detection record'}</p></div>
+          <button className="button secondary" onClick={() => setSelectedIncident(null)}>Close âœ•</button>
+        </div>
+        {detailLoading && <p className="hint">Loading full detection recordâ€¦</p>}
+        <div className="detail-grid">{fields.map(([label, value]) =>
+          <div key={label}><small>{label}</small><strong>{value == null || value === '' ? 'Not recorded' : label === 'Timestamp' ? fmtDate(value) : String(value)}</strong></div>
+        )}</div>
+        <p className="hint">A detection is a signal for investigation, not by itself proof of malicious activity. Missing fields were not returned in the record.</p>
+      </section>
+    </div>
+  }
+
+  return <div className="app-shell">
+    <aside className="sidebar">
+      <div className="brand"><div className="brand-icon">S</div><div><strong>SHIELD</strong><span>NETWORK SECURITY</span></div></div>
+      <div className="nav-label">WORKSPACE</div>
+      <nav>{NAV.map((item, index) =>
+        <button key={item} className={`nav-item ${page === item ? 'active' : ''}`} onClick={() => setPage(item)}>
+          <span className="nav-symbol">{['â—‰', 'âš‘', 'âŒ˜', 'â–¥', 'âœ³'][index]}</span>
+          {item}
+          {item === 'Incidents' && incidents.filter(anomaly).length > 0 && <span className="nav-count">{incidents.filter(anomaly).length}</span>}
+        </button>
+      )}</nav>
+      <div className="sidebar-bottom">
+        <div className="connection-dot"><span className={`dot ${apiHealthy ? 'online' : ''}`} />{apiHealthy ? 'API & storage connected' : 'API/storage unavailable'}</div>
+        <span className="version">SHIELD Â· Phase 1</span>
+      </div>
+    </aside>
+
+    <main className="main-area">
+      <header className="topbar">
+        <div className="breadcrumb">Security Center <span>/</span> {page}</div>
+        <div className="top-actions">
+          <span className="environment"><span className="dot online" /> Development</span>
+          <button className="button secondary" onClick={() => void refresh()} disabled={loading}>{loading ? 'Refreshingâ€¦' : 'â†» Refresh'}</button>
+        </div>
+      </header>
+
+      <div className="page-content">
+        <section className="page-heading">
+          <div>
+            <div className="eyebrow">SITUATIONAL AWARENESS</div>
+            <h1>{page}</h1>
+            <p className="subtitle">
+              {page === 'Overview' ? 'Live network visibility and detection summaries.' :
+                page === 'Incidents' ? 'Search and investigate detection alerts with supporting evidence.' :
+                  page === 'Observed IPs' ? 'Explore IP addresses, protocols, ports, and captured network events.' :
+                    page === 'Kibana' ? 'Detailed Elasticsearch dashboards.' : 'Evidence-grounded network security explanations.'}
+            </p>
+          </div>
+          <div className="updated"><span className={`dot ${updated ? 'online' : ''}`} />{updated ? `Last API check ${updated.toLocaleTimeString()}` : 'Waiting for data'}</div>
+        </section>
+
+        {error && <div className="alert" role="status">{error}</div>}
+
+        {page === 'Overview' && <>
+          <div className="metrics-grid">
+            <article className="metric-card"><div className="metric-top"><span>API & ELASTICSEARCH</span><span className="metric-icon">â—ˆ</span></div><div className="metric-value">{health ? apiHealthy ? 'Online' : 'Degraded' : 'Unknown'}</div><div className="metric-foot">{apiHealthy ? 'Storage reachable' : 'Health check unavailable'}</div></article>
+            <article className="metric-card"><div className="metric-top"><span>ANOMALOUS WINDOWS</span><span className="metric-iconwarning">âš‘</span></div><div className="metric-value">{overview ? num(detections.anomalous_windows) : 'â€”'}</div><div className="metric-foot">Last 60 minutes</div></article>
+            <article className="metric-card"><div className="metric-top"><span>NORMAL WINDOWS</span><span className="metric-icon">âœ“</span></div><div className="metric-value">{overview ? num(detections.normal_windows) : 'â€”'}</div><div className="metric-foot">Last 60 minutes</div></article>
+            <article className="metric-card"><div className="metric-top"><span>OBSERVED IP ADDRESSES</span><span className="metric-icon purple">âŒ˜</span></div><div className="metric-value">{num(ips.length)}</div><div className="metric-foot">Returned IP records</div></article>
+          </div>
+
+          <div className="content-grid">
+            <section className="panel chart-panel"><div className="panel-heading"><div><h2>Network traffic trend</h2><p>Events per 5-minute bucket</p></div></div>{renderTrend()}</section>
+            <section className="panel"><div className="panel-heading"><div><h2>Protocol distribution</h2><p>Events grouped by protocol</p></div></div>{renderProtocols()}</section>
+          </div>
+
+          <section className="panel">
+            <div className="panel-heading"><div><h2>Latest detected alert</h2><p>Most recent anomalous window reported by SHIELD</p></div><button className="text-button" onClick={() => setPage('Incidents')}>Investigate â†’</button></div>
+            {latestAlert ? <>
+              <span className="pill danger">ANOMALY</span>
+              <h3>{String(latestAlert.reason || 'Detection alert').replaceAll('_', ' ')}</h3>
+              <p className="mono">{latestAlert.event_id}</p>
+              <div className="alert-stats">{[['Packets', latestAlert.packets], ['SYN packets', latestAlert.syn_count], ['Destination IPs', latestAlert.unique_dst_ips], ['Destination ports', latestAlert.unique_dst_ports]].map(([label, value]) =>
+                <div key={String(label)}><small>{label}</small><strong>{num(value)}</strong></div>
+              )}</div>
+              <p className="hint">{latestAlert.detector || 'Method not recorded'} Â· {fmtDate(latestAlert.timestamp)}. Anomaly classification is not proof of an attack.</p>
+            </> : <div className="empty">No latest alert available.</div>}
+          </section>
+
+          <div className="content-grid">
+            <section className="panel"><div className="panel-heading"><div><h2>Data freshness</h2><p>Stored event timestamps</p></div></div><div className="freshness-list"><div><span>Last packet</span><strong>{fmtDate(traffic.last_packet_timestamp)}</strong></div><div><span>Last detection record</span><strong>{fmtDate(detections.last_detection_timestamp)}</strong></div><div><span>Dashboard refreshed</span><strong>{updated?.toLocaleTimeString() || 'â€”'}</strong></div></div><p className="hint">Stored timestamps do not prove the sensor process is alive.</p></section>
+            <section className="panel">
+  <div className="panel-heading">
+    <div>
+      <h2>System health</h2>
+      <p>Elasticsearch connectivity and recent activity</p>
+    </div>
+  </div>
+  <div className="health-list">
+    <div>
+      <span>API</span>
+      <strong>{health ? 'Responding' : 'Unavailable'}</strong>
+    </div>
+    <div>
+      <span>Elasticsearch</span>
+      <strong>{systemHealth?.elasticsearch?.status || 'Unknown'}</strong>
+    </div>
+    <div>
+      <span>Sensor activity</span>
+      <strong>{systemHealth?.sensor?.status || 'Unknown'}</strong>
+    </div>
+    <div>
+      <span>Last sensor event</span>
+      <strong>{systemHealth?.sensor?.last_seen ? fmtDate(systemHealth.sensor.last_seen) : 'No data'}</strong>
+    </div>
+    <div>
+      <span>Detector activity</span>
+      <strong>{systemHealth?.detector?.status || 'Unknown'}</strong>
+    </div>
+    <div>
+      <span>Last detection result</span>
+      <strong>{systemHealth?.detector?.last_seen ? fmtDate(systemHealth.detector.last_seen) : 'No data'}</strong>
+    </div>
+  </div>
+  <p className="hint">
+    Activity is inferred from indexed timestamps. Stale activity does not
+    necessarily mean a process has crashed.
+  </p>
+</section>
+          </div>
+
+          <section className="panel"><div className="panel-heading"><div><h2>Recent alerts</h2><p>Latest detection records</p></div><button className="text-button" onClick={() => setPage('Incidents')}>View all â†’</button></div>{renderIncidents()}</section>
+        </>}
+
+        {page === 'Incidents' && <section className="panel">
+          <div className="panel-heading"><div><h2>Alert investigation</h2><p>{filteredIncidents.length} matching records from the latest API response</p></div></div>
+          <div className="incident-filters">
+            <input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search event, reason, IP, detectorâ€¦" aria-label="Search alerts" />
+            <select value={severity} onChange={event => setSeverity(event.target.value)} aria-label="Filter alert classification">
+              <option value="all">All records</option><option value="anomaly">Anomalies only</option><option value="other">Other records</option>
+            </select>
+            <button className="button secondary" onClick={() => { setSearch(''); setSeverity('all') }}>Clear filters</button>
+          </div>
+          {renderIncidents()}
+        </section>}
+
+        {page === 'Observed IPs' && <>
+          <div className="metrics-grid network-metrics">
+            <article className="metric-card"><div className="metric-top"><span>OBSERVED SOURCE IPS</span><span className="metric-icon">âŒ˜</span></div><div className="metric-value">{num(ips.length)}</div><div className="metric-foot">IP records returned by devices endpoint</div></article>
+            <article className="metric-card"><div className="metric-top"><span>RECENT EVENT SAMPLE</span><span className="metric-icon">â†—</span></div><div className="metric-value">{num(events.length)}</div><div className="metric-foot">Latest event records fetched</div></article>
+            <article className="metric-card"><div className="metric-top"><span>PROTOCOL TYPES</span><span className="metric-icon purple">â—ˆ</span></div><div className="metric-value">{num(eventProtocols.length)}</div><div className="metric-foot">Distinct protocols in this sample</div></article>
+            <article className="metric-card"><div className="metric-top"><span>DESTINATION PORTS</span><span className="metric-iconwarning">â‡„</span></div><div className="metric-value">{num(new Set(events.map(row => row.dst_port).filter(value => value != null && value !== '')).size)}</div><div className="metric-foot">Distinct recorded destination ports</div></article>
+          </div>
+
+          <section className="panel">
+            <div className="panel-heading"><div><h2>Observed IP inventory</h2><p>Aggregated source IPs returned by the API</p></div></div>
+            <div className="incident-filters">
+              <input value={ipSearch} onChange={event => setIpSearch(event.target.value)} placeholder="Search IP addressâ€¦" aria-label="Search observed IPs" />
+              <select value={scopeFilter} onChange={event => setScopeFilter(event.target.value)} aria-label="Filter IP scope">
+                <option value="all">All scopes</option><option value="private">Private</option><option value="public_or_other">Public / other</option><option value="unknown">Unknown</option>
+              </select>
+              <button className="button secondary" onClick={() => { setIpSearch(''); setScopeFilter('all') }}>Clear filters</button>
+            </div>
+            {renderIPs()}
+            <p className="hint">The current devices endpoint aggregates source IPs. It does not necessarily represent every physical device on the network. IP scope alone is not a threat verdict.</p>
+          </section>
+
+          <div className="content-grid">
+            <section className="panel"><div className="panel-heading"><div><h2>Protocol breakdown</h2><p>Distribution within the latest {events.length} event records</p></div></div>{renderEventProtocolBreakdown()}</section>
+            <section className="panel"><div className="panel-heading"><div><h2>Top destination ports</h2><p>Ranked within the fetched event sample</p></div></div>
+              {topPorts.length ? <div className="port-list">{topPorts.map(item => {
+                const max = Math.max(...topPorts.map(port => port.count), 1)
+                return <div className="port-row" key={item.port}><div className="port-label"><strong>{item.port}</strong><span>{num(item.count)} events</span></div><div className="progress-track"><div className="progress-fill" style={{ width: `${item.count / max * 100}%` }} /></div></div>
+              })}</div> : <div className="empty">No destination-port data in the current sample.</div>}
+            </section>
+          </div>
+
+          <section className="panel">
+            <div className="panel-heading"><div><h2>Traffic explorer</h2><p>{num(filteredEvents.length)} matching rows from the latest {events.length} events fetched</p></div></div>
+            <div className="incident-filters">
+              <input value={trafficSearch} onChange={event => setTrafficSearch(event.target.value)} placeholder="Search source/destination IP or portâ€¦" aria-label="Search network events" />
+              <select value={protocolFilter} onChange={event => setProtocolFilter(event.target.value)} aria-label="Filter protocol">
+                <option value="all">All protocols</option>
+                {eventProtocols.map(item => <option key={item.protocol} value={item.protocol.toLowerCase()}>{item.protocol}</option>)}
+              </select>
+              <select value={portFilter} onChange={event => setPortFilter(event.target.value)} aria-label="Filter destination port">
+                <option value="all">All destination ports</option>
+                {[...new Set(events.map(row => display(row.dst_port)).filter(port => port !== 'â€”'))].sort((a, b) => Number(a) - Number(b)).map(port => <option key={port} value={port}>{port}</option>)}
+              </select>
+              <button className="button secondary" onClick={() => { setTrafficSearch(''); setProtocolFilter('all'); setPortFilter('all') }}>Clear filters</button>
+            </div>
+            {renderEvents()}
+            <p className="hint">This view uses the latest event records returned by the API, not a complete historical packet capture. Use Kibana for broader time-range analysis.</p>
+          </section>
+        </>}
+
+        {page === 'Kibana' && <section className="feature-panel"><div className="feature-icon">â–¥</div><h2>Technical traffic dashboards</h2><p>Open your existing Kibana dashboards for detailed Elasticsearch visualizations.</p><button className="button primary" onClick={openKibana}>Open Kibana â†—</button></section>}
+
+        {page === 'AI Assistant' && <section className="assistant-panel">
+          <div className="assistant-header"><div className="feature-icon">âœ³</div><div><h2>SHIELD Intelligence</h2><p>Evidence-backed network security assistant</p></div><span className="pill neutral">RAG not connected</span></div>
+          <div className="assistant-message"><strong>SHIELD AI</strong><p>The RAG backend will retrieve real incident records and project documentation before generating answers.</p></div>
+          <div className="suggestions">{['Explain the latest anomaly', 'What does a SYN flood mean?', 'Summarize recent traffic'].map(prompt => <button key={prompt} onClick={() => setQuestion(prompt)}>{prompt} â†’</button>)}</div>
+          <form className="chat-input" onSubmit={event => { event.preventDefault(); setError('RAG is not connected yet. No answer was generated.') }}>
+            <input value={question} onChange={event => setQuestion(event.target.value)} placeholder="Ask about an alertâ€¦" />
+            <button className="button primary" disabled={!question.trim()}>Send â†‘</button>
+          </form>
+        </section>}
+
+        <footer className="footer"><span>SHIELD Â· Secure Home Intelligent Edge Log Detection</span><span>Auto-refresh: 15 seconds Â· <button onClick={() => void refresh()}>Refresh now</button></span></footer>
+      </div>
+    </main>
+    {renderIncidentDetails()}
+  </div>
+}
+
+export default App
+
+
